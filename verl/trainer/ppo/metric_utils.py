@@ -16,7 +16,6 @@ Metrics related to the PPO trainer.
 """
 
 from collections import defaultdict
-from functools import partial
 from typing import Any, Callable
 
 import numpy as np
@@ -507,153 +506,120 @@ def calc_maj_val(data: list[dict[str, Any]], vote_key: str, val_key: str) -> flo
 
     return maj_val
 
-
-def process_validation_metrics(
-    data_sources: list[str], sample_uids: list[str], infos_dict: dict[str, list[Any]], seed: int = 42
-) -> dict[str, dict[str, dict[str, float]]]:
+def process_validation_metrics(reward_logs) -> dict[str, Any]:
     """
-    Process validation metrics into a structured format with statistical analysis.
+    Aggregate validation-time evaluation metrics from per-sample reward logs.
 
-    This function organizes validation metrics by data source and prompt, then computes
-    various statistical measures including means, standard deviations, best/worst values,
-    and majority voting results. It also performs bootstrap sampling to estimate statistics
-    for different sample sizes.
-
-    Args:
-        data_sources: List of data source identifiers for each sample.
-        sample_uids: List of sample uids corresponding to each sample.
-        infos_dict: Dictionary mapping variable names to lists of values for each sample.
-        seed: Random seed for bootstrap sampling. Defaults to 42.
+    Each entry in ``reward_logs`` is the ``reward_log`` dict produced by
+    ``MultiRewardEvaluator.compute_token_level_rewards`` (see ``m3_agent.py``).
+    Samples are grouped by their ``fail_parsing`` flag:
+      - ``0`` -> valid sample, contributes to accuracy / memory / face stats
+      - ``1`` -> format / parse error
+      - ``2`` -> reward-side evaluation failure
 
     Returns:
-        A nested dictionary with the structure:
-        {
-            data_source: {
-                variable_name: {
-                    metric_name: value
-                }
-            }
-        }
-
-        Where metric_name includes:
-        - "mean@N": Mean value across N samples
-        - "std@N": Standard deviation across N samples
-        - "best@N/mean": Mean of the best values in bootstrap samples of size N
-        - "best@N/std": Standard deviation of the best values in bootstrap samples
-        - "worst@N/mean": Mean of the worst values in bootstrap samples
-        - "worst@N/std": Standard deviation of the worst values in bootstrap samples
-        - "maj@N/mean": Mean of majority voting results in bootstrap samples (if "pred" exists)
-        - "maj@N/std": Standard deviation of majority voting results (if "pred" exists)
-
-    Example:
-        >>> data_sources = ["source1", "source1", "source2"]
-        >>> sample_uids = ["uid1", "uid1", "uid2"]
-        >>> infos_dict = {"score": [0.8, 0.9, 0.7], "pred": ["A", "A", "B"]}
-        >>> result = process_validation_metrics(data_sources, sample_uids, infos_dict)
-        >>> # result will contain statistics for each data source and variable
+        A dict of scalar metrics suitable for logging to wandb / tensorboard.
     """
-    # Group metrics by data source, prompt and variable
-    data_src2uid2var2vals = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
-    for sample_idx, data_source in enumerate(data_sources):
-        uid = sample_uids[sample_idx]
-        var2vals = data_src2uid2var2vals[data_source][uid]
-        for var_name, var_vals in infos_dict.items():
-            var2vals[var_name].append(var_vals[sample_idx])
+    error_rate, think_length, correct_rate, fail_case = [], [], [], []
+    avg_memory_count, redundancy_rate = [], []
+    invalid_face, fail_parsing = [], []
+    avg_face_count, avg_invalid_face_count = [], []
+    fail_evaluate, over_thinking, memory_token_len, acc_rate = [], [], [], []
+    total_rate = []
+    current_win, current_tie, current_loss = {}, {}, {}
+    current_win_second, current_tie_second, current_loss_second = {}, {}, {}
 
-    np_mean = np.mean
-    np_std = np.std
-    reduce_fns_best_worst = [np.max, np.min]
-    n_bootstrap = 1000
+    for reward_log in reward_logs:
+        if reward_log["fail_parsing"] == 0:
+            correct_rate.append(reward_log["num_correct"])
+            error_rate.append(reward_log["num_wrong"])
+            if len(reward_log["correctness_list"]):
+                acc_rate.append(sum(reward_log["correctness_list"]) / len(reward_log["correctness_list"]))
+            if len(reward_log["redundancy_list"]):
+                redundancy_rate.append(1 - sum(reward_log["redundancy_list"]) / len(reward_log["redundancy_list"]))
+            avg_memory_count.append(len(reward_log["correctness_list"]))
+            avg_face_count.append(sum(reward_log["has_face_list"]))
+            if len(reward_log["valid_list"]):
+                total_rate.append(sum(reward_log["valid_list"]) / len(reward_log["valid_list"]))
+            if sum(reward_log["has_face_list"]):
+                avg_invalid_face_count.append(sum(reward_log["invalid_face_list"]))
+            memory_token_len.append(reward_log["memory_token_length"])
+        elif reward_log["fail_parsing"] == 2:
+            fail_evaluate.append(1)
 
-    # 2. cache ns list
-    def gen_ns(n_resps: int) -> list[int]:
-        if n_resps <= 1:
-            return []
-        ns = []
-        n = 2
-        while n < n_resps:
-            ns.append(n)
-            n *= 2
-        ns.append(n_resps)
-        return ns
+        invalid_face.append(1 if reward_log["has_invalid_face"] else 0)
+        fail_parsing.append(1 if reward_log["is_format_error"] else 0)
+        over_thinking.append(1 if reward_log["over_thinking"] else 0)
+        think_length.append(reward_log["think_len"])
+        fail_case.append(1 if reward_log["fail_parsing"] == 1 else 0)
 
-    ns_cache = {}
+    final_win, final_tie, final_loss = {}, {}, {}
+    for uid, reward_log in enumerate(reward_logs):
+        if "ref_loss" in reward_log:
+            if reward_log["ref_loss"] in [0, 1, 2]:
+                current_tie[uid] = 1 if reward_log["ref_loss"] == 2 else 0
+                current_loss[uid] = 1 if reward_log["ref_loss"] == 0 else 0
+            if reward_log["ref_loss"] in [0, 1]:
+                current_win[uid] = 1 if reward_log["ref_loss"] == 1 else 0
 
-    # 3. cache metric results
-    data_src2uid2var2metric = {}
+        if "ref_loss_second" in reward_log:
+            if reward_log["ref_loss_second"] in [0, 1, 2]:
+                current_tie_second[uid] = 1 if reward_log["ref_loss_second"] == 2 else 0
+                current_loss_second[uid] = 1 if reward_log["ref_loss_second"] == 0 else 0
+            if reward_log["ref_loss_second"] in [0, 1]:
+                current_win_second[uid] = 1 if reward_log["ref_loss_second"] == 1 else 0
 
-    # 4. flatten loop
-    for data_source, uid2var2vals in data_src2uid2var2vals.items():
-        # create uid dict
-        uid_dict = data_src2uid2var2metric.setdefault(data_source, {})
+        if "curr_win_final" in reward_log:
+            if reward_log["curr_win_final"] in [0, 1, 2]:
+                final_tie[uid] = 1 if reward_log["curr_win_final"] == 2 else 0
+                final_loss[uid] = 1 if reward_log["curr_win_final"] == 0 else 0
+            if reward_log["curr_win_final"] in [0, 1]:
+                final_win[uid] = 1 if reward_log["curr_win_final"] == 1 else 0
 
-        for uid, var2vals in uid2var2vals.items():
-            pred_vals = var2vals.get("pred")
-            has_pred = pred_vals is not None
-            var_dict = uid_dict.setdefault(uid, {})
+    def _mean(xs):
+        return torch.mean(torch.tensor(xs, dtype=torch.float32)).detach().item()
 
-            for var_name, var_vals in var2vals.items():
-                # skip empty or string values
-                if not var_vals or isinstance(var_vals[0], str):
-                    continue
+    def _sum(xs):
+        return torch.sum(torch.tensor(xs, dtype=torch.float32)).detach().item()
 
-                # compute mean and std
-                n_resps = len(var_vals)
-                metric = {f"mean@{n_resps}": float(np_mean(var_vals))}
+    def _dict_ratio(d, complement=False):
+        if not d:
+            return 0
+        avg = sum(d.values()) / len(d)
+        return 1 - avg if complement else avg
 
-                if n_resps > 1:
-                    metric[f"std@{n_resps}"] = float(np_std(var_vals))
+    metrics = {
+        "memory/count/mean": _mean(avg_memory_count),
+        "memory/count/max": torch.max(torch.tensor(avg_memory_count, dtype=torch.float32)).detach().item(),
+        "memory/count/min": torch.min(torch.tensor(avg_memory_count, dtype=torch.float32)).detach().item(),
+        "memory/accuracy/correct_count": _mean(correct_rate),
+        "memory/accuracy/error_count": _mean(error_rate),
+        "memory/face/total_count": _mean(avg_face_count),
+        "memory/face/invalid_count": _mean(avg_invalid_face_count),
+        "memory/redundancy_rate/mean": _mean(redundancy_rate),
+        "memory/accuracy/acc_rate": _mean(acc_rate),
+        "memory/total_rate/mean": _mean(total_rate),
 
-                    # cache ns list
-                    if n_resps not in ns_cache:
-                        ns_cache[n_resps] = gen_ns(n_resps)
-                    ns = ns_cache[n_resps]
+        "trajectory/reward/avg_think_length": sum(think_length) / len(think_length),
+        "trajectory/reward/avg_memory_length": sum(memory_token_len) / len(memory_token_len),
 
-                    # compute best/worst metrics
-                    for n in ns:
-                        # compute best/worst metrics
-                        (bon_mean, bon_std), (won_mean, won_std) = bootstrap_metric(
-                            data=var_vals,
-                            subset_size=n,
-                            reduce_fns=reduce_fns_best_worst,
-                            n_bootstrap=n_bootstrap,
-                            seed=seed,
-                        )
-                        metric[f"best@{n}/mean"] = bon_mean
-                        metric[f"best@{n}/std"] = bon_std
-                        metric[f"worst@{n}/mean"] = won_mean
-                        metric[f"worst@{n}/std"] = won_std
+        "trajectory/test_time/policy_win_ratio": _dict_ratio(current_win),
+        "trajectory/test_time/policy_tie_ratio": _dict_ratio(current_tie),
+        "trajectory/test_time/policy_tie&win_ratio": _dict_ratio(current_loss, complement=True),
 
-                        # compute maj metrics
-                        if has_pred:
-                            # create vote_data
-                            vote_data = [
-                                {"val": val, "pred": pred} for val, pred in zip(var_vals, pred_vals, strict=True)
-                            ]
-                            # compute maj metrics
-                            [(maj_n_mean, maj_n_std)] = bootstrap_metric(
-                                data=vote_data,
-                                subset_size=n,
-                                reduce_fns=[partial(calc_maj_val, vote_key="pred", val_key="val")],
-                                n_bootstrap=n_bootstrap,
-                                seed=seed,
-                            )
-                            metric[f"maj@{n}/mean"] = maj_n_mean
-                            metric[f"maj@{n}/std"] = maj_n_std
+        "trajectory/test_time/policy_win_ratio_second": _dict_ratio(current_win_second),
+        "trajectory/test_time/policy_tie_ratio_second": _dict_ratio(current_tie_second),
+        "trajectory/test_time/policy_tie&win_ratio_second": _dict_ratio(current_loss_second, complement=True),
 
-                var_dict[var_name] = metric
+        "trajectory/test_time/final_win_ratio": _dict_ratio(final_win),
+        "trajectory/test_time/final_tie_ratio": _dict_ratio(final_tie),
+        "trajectory/test_time/final_tie&win_ratio": _dict_ratio(final_loss, complement=True),
 
-    # Aggregate metrics across uids
-    data_src2var2metric2uid_vals = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
-    for data_source, uid2var2metric in data_src2uid2var2metric.items():
-        for uid, var2metric in uid2var2metric.items():
-            for var_name, metric in var2metric.items():
-                for metric_name, metric_val in metric.items():
-                    data_src2var2metric2uid_vals[data_source][var_name][metric_name].append(metric_val)
+        "trajectory/error/failure_case_count": _sum(fail_case),
+        "trajectory/error/invalid_face_count": _sum(invalid_face),
+        "trajectory/error/fail_parsing_count": _sum(fail_parsing),
+        "trajectory/error/over_thinking_length_count": _sum(over_thinking),
+        "trajectory/error/fail_evaluate_count": _sum(fail_evaluate),
+    }
 
-    data_src2var2metric2val = defaultdict(lambda: defaultdict(lambda: defaultdict(float)))
-    for data_source, var2metric2uid_vals in data_src2var2metric2uid_vals.items():
-        for var_name, metric2uid_vals in var2metric2uid_vals.items():
-            for metric_name, uid_vals in metric2uid_vals.items():
-                data_src2var2metric2val[data_source][var_name][metric_name] = np.mean(uid_vals)
-    return data_src2var2metric2val
+    return metrics

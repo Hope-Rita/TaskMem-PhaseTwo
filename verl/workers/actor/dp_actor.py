@@ -45,6 +45,7 @@ __all__ = ["DataParallelPPOActor"]
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
+import torch.distributed as dist
 
 class DataParallelPPOActor(BasePPOActor):
     """FSDP DataParallel PPO Actor or Ref worker
@@ -388,6 +389,59 @@ class DataParallelPPOActor(BasePPOActor):
                 outputs["sum_pi_squared"] = sum_pi_squared
             return outputs
 
+    @torch.no_grad()
+    def _extract_steer_matrix(self) -> torch.Tensor:
+        rows = {}
+
+        for name, module in self.actor_module.named_modules():
+            layer_idx = getattr(module, "layer_idx", None)
+            adapter = getattr(module, "adapter", None)
+
+            if layer_idx is None or adapter is None or not hasattr(adapter, "steer"):
+                continue
+
+            steer = adapter.steer.detach().reshape(-1).cpu().to(torch.bfloat16)
+
+            if layer_idx not in rows:
+                rows[layer_idx] = steer
+
+        if not rows:
+            raise RuntimeError("No modules with (layer_idx, adapter.steer) found")
+
+        ordered_layer_idxs = sorted(rows.keys())
+        mat = torch.stack([rows[i] for i in ordered_layer_idxs], dim=0)
+        return mat
+
+    @torch.no_grad()
+    def _save_step_steer_matrix(self, save_root: str, global_step: int):
+        rank = dist.get_rank() if dist.is_initialized() else 0
+
+        save_dir = os.path.join(save_root, str(global_step))
+        os.makedirs(save_dir, exist_ok=True)
+
+        save_path = os.path.join(save_dir, "steer.pt")
+
+        if isinstance(self.actor_module, FSDP):
+            with FSDP.summon_full_params(self.actor_module, writeback=False, rank0_only=True):
+                if rank == 0:
+                    mat = self._extract_steer_matrix()
+                    torch.save(
+                        {
+                            "global_step": global_step,
+                            "matrix": mat,
+                        },
+                        save_path,
+                    )
+        else:
+            if rank == 0:
+                mat = self._extract_steer_matrix()
+                torch.save(
+                    {
+                        "global_step": global_step,
+                        "matrix": mat,
+                    },
+                    save_path,
+                )
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
         if self.scaler is not None:
@@ -512,6 +566,14 @@ class DataParallelPPOActor(BasePPOActor):
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         pad_token_id = data.meta_info.get("pad_token_id", 0)
+        global_step = data.meta_info.get("global_step", None)
+        save_root = data.meta_info.get("save_root", None)
+
+        if global_step is None and "global_step" in data.non_tensor_batch:
+            global_step = data.non_tensor_batch["global_step"]
+
+        if save_root is None and "save_root" in data.non_tensor_batch:
+            save_root = data.non_tensor_batch["save_root"]
 
         select_keys = [
             "responses",
@@ -521,11 +583,15 @@ class DataParallelPPOActor(BasePPOActor):
             "position_ids",
             "old_log_probs",
             "advantages",
+            "ref_log_prob",
         ]
         if self.use_prefix_grouper and "prompts" in data.batch.keys():
             select_keys.append("prompts")
-        if self.config.use_kl_loss:
-            select_keys.append("ref_log_prob")
+
+        loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
+        if loss_mode == "dpo":
+            select_keys.append("swap_response_mask")
+
         # Include pre-computed IS weights if present in batch
         # Weights are computed centrally in trainer and added to batch when algorithm.rollout_is=True
         if "rollout_is_weights" in data.batch.keys():
@@ -600,9 +666,6 @@ class DataParallelPPOActor(BasePPOActor):
                         else:
                             old_log_prob = model_inputs["old_log_probs"]
 
-                    loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
-                    # vanilla -> verl.trainer.ppo.core_algos.compute_policy_loss_vanilla
-
                     # Extract pre-computed rollout correction weights if present
                     # Weights are computed centrally in trainer and added when algorithm.rollout_is=True
                     rollout_is_weights = model_inputs.get("rollout_is_weights", None)
@@ -612,15 +675,41 @@ class DataParallelPPOActor(BasePPOActor):
                     policy_loss_fn = get_policy_loss_fn(loss_mode)
 
                     # Compute policy loss (any function is expected to return 2 values)
-                    pg_loss, pg_metrics = policy_loss_fn(
-                        old_log_prob=old_log_prob,
-                        log_prob=log_prob,
-                        advantages=advantages,
-                        response_mask=response_mask,
-                        loss_agg_mode=loss_agg_mode,
-                        config=self.config,
-                        rollout_is_weights=rollout_is_weights,
-                    )
+                    if loss_mode == "dpo":
+                        response_length = response_mask.shape[1]
+                        ot_log_prob = old_log_prob[:, :response_length]
+                        ot_ref_prob = old_log_prob[:, response_length:]
+                        # log_prob, model_inputs["ref_log_prob"]
+                        swap_response_mask = model_inputs["swap_response_mask"]
+
+                        condition = advantages[:, 0] > 0
+                        win_log_prob = torch.where(condition.unsqueeze(1), log_prob, ot_log_prob)
+                        lose_log_prob = torch.where(~condition.unsqueeze(1), log_prob, ot_log_prob)
+                        win_ref_log_prob = torch.where(condition.unsqueeze(1), model_inputs["ref_log_prob"], ot_ref_prob)
+                        lose_ref_log_prob = torch.where(~condition.unsqueeze(1), model_inputs["ref_log_prob"], ot_ref_prob)
+                        win_response_mask = torch.where(condition.unsqueeze(1), response_mask, swap_response_mask)
+                        lose_response_mask = torch.where(~condition.unsqueeze(1), response_mask, swap_response_mask)
+
+                        pg_loss, pg_metrics = policy_loss_fn(
+                            win_log_prob=win_log_prob,
+                            lose_log_prob=lose_log_prob,
+                            win_ref_log_prob=win_ref_log_prob,
+                            lose_ref_log_prob=lose_ref_log_prob,
+                            win_response_mask=win_response_mask,
+                            lose_response_mask=lose_response_mask,
+                            config=self.config,
+                            rollout_is_weights=rollout_is_weights,
+                        )
+                    else:
+                        pg_loss, pg_metrics = policy_loss_fn(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            loss_agg_mode=loss_agg_mode,
+                            config=self.config,
+                            rollout_is_weights=rollout_is_weights,
+                        )
                     micro_batch_metrics.update(pg_metrics)
 
                     # Skip if using bypass_mode loss (metrics already computed in pg_metrics)
@@ -673,4 +762,6 @@ class DataParallelPPOActor(BasePPOActor):
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, mini_batch_metrics)
         self.actor_optimizer.zero_grad()
+        self._save_step_steer_matrix(save_root=save_root, global_step=global_step)
+
         return metrics

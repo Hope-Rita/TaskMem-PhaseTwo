@@ -27,6 +27,7 @@ from .model import HFModelConfig
 from .optimizer import OptimizerConfig
 
 __all__ = [
+    "DPOConfig",
     "PolicyLossConfig",
     "RouterReplayConfig",
     "ActorConfig",
@@ -37,6 +38,19 @@ __all__ = [
     "TorchTitanActorConfig",
 ]
 
+@dataclass
+class DPOConfig(BaseConfig):
+    """Configuration for DPO loss.
+
+    The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
+
+    Args:
+        beta (float): Temperature parameter for DPO loss.
+        loss_type (str): Type of DPO loss. Options: 'dpo', 'ipo'.
+    """
+
+    beta: float = 0.1
+    loss_type: str = "dpo"
 
 @dataclass
 class RouterReplayConfig(BaseConfig):
@@ -176,6 +190,7 @@ class ActorConfig(BaseConfig):
     rollout_n: int = MISSING  # must be override by sampling config
     model_config: HFModelConfig = field(default_factory=BaseConfig)
     router_replay: RouterReplayConfig = field(default_factory=RouterReplayConfig)
+    dpo_config: DPOConfig = field(default_factory=DPOConfig)
 
     # Store global batch info for loss aggregation:
     # dp_size: data parallel size

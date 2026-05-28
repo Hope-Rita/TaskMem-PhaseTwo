@@ -850,6 +850,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # This is used to import external_lib into the huggingface systems
         import_external_libs(self.config.model.get("external_lib", None))
+        
+        # [ADAPTER] sync HF model version with vLLM
+        plugins = os.environ.get("VLLM_PLUGINS")
+        if plugins is None or "qwen3vllm_ada" in map(str.strip, plugins.split(",")):
+            import modeling.qwen3hf_ada as qwen3hf_ada
+            qwen3hf_ada.register()   
 
         # Initialize QAT config before _build_model_optimizer
         self._init_qat_config()

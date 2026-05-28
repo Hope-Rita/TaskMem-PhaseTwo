@@ -56,27 +56,35 @@ class SingleTurnAgentLoop(AgentLoopBase):
         # 3. generate sequences
         metrics = {}
         with simple_timer("generate_sequences", metrics):
-            output = await self.server_manager.generate(
-                request_id=uuid4().hex,
-                prompt_ids=prompt_ids,
-                sampling_params=sampling_params,
-                image_data=images,
-                video_data=videos,
-            )
-        if metrics.get("num_preempted") is None:
-            metrics["num_preempted"] = output.num_preempted if output.num_preempted is not None else -1
-        response_mask = [1] * len(output.token_ids)
+            if kwargs.get("need_rollout", True):
+                output = await self.server_manager.generate(
+                    request_id=uuid4().hex,
+                    prompt_ids=prompt_ids,
+                    sampling_params=sampling_params,
+                    image_data=images,
+                    video_data=videos,
+                )
+                if metrics.get("num_preempted") is None:
+                    metrics["num_preempted"] = output.num_preempted if output.num_preempted is not None else -1
+                response = output.token_ids
+                response_logprobs = output.log_probs[: self.response_length] if output.log_probs else None
+                routed_experts = (
+                    output.routed_experts[: len(prompt_ids) + self.response_length]
+                    if output.routed_experts is not None
+                    else None
+                )
+            else:
+                response = kwargs["response"] + '<|im_end|>\n'
+                response = self.processor.tokenizer.encode(response, add_special_tokens=False)
+                response_logprobs = routed_experts = None
+            response_mask = [1] * len(response)
 
         output = AgentLoopOutput(
             prompt_ids=prompt_ids,
-            response_ids=output.token_ids[: self.response_length],
+            response_ids=response[: self.response_length],
             response_mask=response_mask[: self.response_length],
-            response_logprobs=output.log_probs[: self.response_length] if output.log_probs else None,
-            routed_experts=(
-                output.routed_experts[: len(prompt_ids) + self.response_length]
-                if output.routed_experts is not None
-                else None
-            ),
+            response_logprobs=response_logprobs,
+            routed_experts=routed_experts,
             multi_modal_data=multi_modal_data,
             num_turns=2,
             metrics=metrics,

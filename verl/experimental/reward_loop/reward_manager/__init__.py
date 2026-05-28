@@ -17,10 +17,13 @@ from .dapo import DAPORewardManager
 from .naive import NaiveRewardManager
 from .limited import RateLimitedRewardManager
 from .remote import RemoteRewardManager
+from .m3_agent import M3AgentRewardManager
+
 
 __all__ = [
     "DAPORewardManager",
     "NaiveRewardManager",
+    "M3AgentRewardManager",
     "RateLimitedRewardManager",
     "RemoteRewardManager",
     "register",

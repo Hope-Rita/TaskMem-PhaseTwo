@@ -305,11 +305,14 @@ def chunk_tensordict(td: TensorDict, chunks: int) -> list[TensorDict]:
 
     tds = new_td.chunk(chunks=chunks)
     for key in keys:
-        tensors = td[key].unbind(dim=0)
-        for i, chunk_td in enumerate(tds):
-            chunk_td[key] = torch.nested.as_nested_tensor(
-                tensors[i * chunk_size : (i + 1) * chunk_size], layout=torch.jagged
-            )
+        if td.batch_size[0] > 1:
+            tensors = td[key].unbind(dim=0)
+            for i, chunk_td in enumerate(tds):
+                chunk_td[key] = torch.nested.as_nested_tensor(
+                    tensors[i * chunk_size : (i + 1) * chunk_size], layout=torch.jagged
+                )
+        else:
+            tds[0][key] = td[key]
 
     return tds
 

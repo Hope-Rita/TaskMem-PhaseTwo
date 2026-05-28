@@ -496,180 +496,39 @@ class RayPPOTrainer:
         return batch_reward
 
     def _validate(self, merged: bool = False):
-        data_source_lst = []
-        reward_extra_infos_dict: dict[str, list] = defaultdict(list)
-
-        # Lists to collect samples for the table
-        sample_inputs = []
-        sample_outputs = []
-        sample_gts = []
-        sample_scores = []
-        sample_turns = []
-        sample_uids = []
+        results = []
+        val_metrics = {}
 
         for test_data in self.val_dataloader:
-            test_batch = DataProto.from_single_dict(test_data)
-
-            if "uid" not in test_batch.non_tensor_batch:
-                test_batch.non_tensor_batch["uid"] = np.array(
-                    [str(uuid.uuid4()) for _ in range(len(test_batch.batch))], dtype=object
-                )
+            test_gen_batch = DataProto.from_single_dict(test_data)
 
             # repeat test batch
-            test_batch = test_batch.repeat(
+            test_gen_batch = test_gen_batch.repeat(
                 repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True
             )
-
-            ground_truths = [
-                item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_batch
-            ]
-            sample_gts.extend(ground_truths)
-
-            test_gen_batch = self._get_gen_batch(test_batch)
-            test_gen_batch.meta_info = {
-                "eos_token_id": self.tokenizer.eos_token_id,
-                "pad_token_id": self.tokenizer.pad_token_id,
-                "recompute_log_prob": False,
-                "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
-                "validate": True,
-                "global_steps": self.global_steps,
-            }
-            print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
-
+            test_gen_batch.non_tensor_batch["uid"] = np.array(
+                [str(uuid.uuid4()) for _ in range(len(test_gen_batch.batch))], dtype=object
+            )
+            test_gen_batch.non_tensor_batch["root_path"] = np.array([str(self.config.trainer.default_local_dir)] * len(test_gen_batch.batch))
+            test_gen_batch.non_tensor_batch["global_steps"] = np.array([int(self.global_steps)] * len(test_gen_batch.batch))
             # pad to be divisible by dp_size
             size_divisor = self.config.actor_rollout_ref.rollout.agent.num_workers
-            test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
+            test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)          
             test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
-
-            if self.use_rm and "rm_scores" not in test_output_gen_batch_padded.batch.keys():
-                # for colocate reward models, we need to sleep rollout model
-                # to spare GPU memory for reward model
-                self.checkpoint_manager.sleep_replicas()
-                batch_reward = self._compute_reward_colocate(test_output_gen_batch_padded)
-                test_output_gen_batch_padded = test_output_gen_batch_padded.union(batch_reward)
-                # wake up rollout model
-                # replace with wake_up method once supported
-                self.checkpoint_manager.update_weights()
 
             # unpad
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
 
             print("validation generation end")
 
-            # Store generated outputs
-            output_ids = test_output_gen_batch.batch["responses"]
-            output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
-            sample_outputs.extend(output_texts)
-
-            test_batch = test_batch.union(test_output_gen_batch)
-            test_batch.meta_info["validate"] = True
-
-            # Store original inputs
-            input_ids = test_batch.batch["prompts"]
-            # TODO: Can we keep special tokens except for padding tokens?
-            input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
-            sample_inputs.extend(input_texts)
-            sample_uids.extend(test_batch.non_tensor_batch["uid"])
+            test_gen_batch = test_gen_batch.union(test_output_gen_batch)
+            test_gen_batch.meta_info["validate"] = True
 
             # evaluate using reward_function
-            reward_tensor, reward_extra_info = extract_reward(test_batch)
-
-            scores = reward_tensor.sum(-1).cpu().tolist()
-            sample_scores.extend(scores)
-
-            reward_extra_infos_dict["reward"].extend(scores)
-            for key, values in reward_extra_info.items():
-                if key not in reward_extra_infos_dict:
-                    reward_extra_infos_dict[key] = []
-                if isinstance(values, np.ndarray):
-                    reward_extra_infos_dict[key].extend(values.tolist())
-                else:
-                    reward_extra_infos_dict[key].extend(values if isinstance(values, list) else [values])
-
-            # collect num_turns of each prompt
-            if "__num_turns__" in test_batch.non_tensor_batch:
-                sample_turns.append(test_batch.non_tensor_batch["__num_turns__"])
-
-            data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
-
-        self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
-
-        # dump generations
-        val_data_dir = self.config.trainer.get("validation_data_dir", None)
-        if val_data_dir:
-            self._dump_generations(
-                inputs=sample_inputs,
-                outputs=sample_outputs,
-                gts=sample_gts,
-                scores=sample_scores,
-                reward_extra_infos_dict=reward_extra_infos_dict,
-                dump_path=val_data_dir,
-            )
-
-        for key_info, lst in reward_extra_infos_dict.items():
-            assert len(lst) == 0 or len(lst) == len(sample_scores), f"{key_info}: {len(lst)=}, {len(sample_scores)=}"
-
-        if merged:
-            print("_merge_validation_results validate result will be merged")
-            return {
-                "data_sources": data_source_lst,
-                "sample_uids": sample_uids,
-                "sample_turns": sample_turns,
-                "reward_extra_infos_dict": reward_extra_infos_dict,
-            }
-        data_sources = np.concatenate(data_source_lst, axis=0)
-        return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
-
-    def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns):
-        data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
-        metric_dict = {}
-        for data_source, var2metric2val in data_src2var2metric2val.items():
-            core_var = "acc" if "acc" in var2metric2val else "reward"
-            for var_name, metric2val in var2metric2val.items():
-                n_max = max([int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys()])
-                for metric_name, metric_val in metric2val.items():
-                    if (
-                        (var_name == core_var)
-                        and any(metric_name.startswith(pfx) for pfx in ["mean", "maj", "best"])
-                        and (f"@{n_max}" in metric_name)
-                    ):
-                        metric_sec = "val-core"
-                    else:
-                        metric_sec = "val-aux"
-                    pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
-                    metric_dict[pfx] = metric_val
-
-        if len(sample_turns) > 0:
-            sample_turns = np.concatenate(sample_turns)
-            metric_dict["val-aux/num_turns/min"] = sample_turns.min()
-            metric_dict["val-aux/num_turns/max"] = sample_turns.max()
-            metric_dict["val-aux/num_turns/mean"] = sample_turns.mean()
-
-        return metric_dict
-
-    def _merge_validation_results(self, result_a, result_b):
-        if result_a is None and result_b is None:
-            return {}
-        if result_a is None:
-            result_a = {"data_sources": [], "sample_uids": [], "sample_turns": [], "reward_extra_infos_dict": {}}
-        if result_b is None:
-            result_b = {"data_sources": [], "sample_uids": [], "sample_turns": [], "reward_extra_infos_dict": {}}
-
-        if not result_a.get("data_sources") and not result_b.get("data_sources"):
-            return {}
-
-        data_sources = np.concatenate(result_a["data_sources"] + result_b["data_sources"], axis=0)
-        sample_uids = result_a["sample_uids"] + result_b["sample_uids"]
-        sample_turns = result_a["sample_turns"] + result_b["sample_turns"]
-
-        reward_extra_infos_dict = {}
-        all_keys = set(result_a["reward_extra_infos_dict"].keys()) | set(result_b["reward_extra_infos_dict"].keys())
-        for key in all_keys:
-            list_a = result_a["reward_extra_infos_dict"].get(key, [])
-            list_b = result_b["reward_extra_infos_dict"].get(key, [])
-            reward_extra_infos_dict[key] = list_a + list_b
-
-        return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+            reward_tensor, reward_extra_info = extract_reward(test_gen_batch)
+            results.extend(reward_extra_info["reward_log"])
+        val_metrics = process_validation_metrics(results)
+        return val_metrics
 
     def init_workers(self):
         """Initialize distributed training workers using Ray backend.
@@ -1156,6 +1015,8 @@ class RayPPOTrainer:
         batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
         # TODO: Make "temperature" single source of truth from generation.
         batch.meta_info["temperature"] = rollout_config.temperature
+        batch.meta_info["global_step"] = self.global_steps
+        batch.meta_info["save_root"] = self.config.trainer.default_local_dir
         # update actor
         if self.use_legacy_worker_impl == "disable":
             batch_td = batch.to_tensordict()
@@ -1175,6 +1036,8 @@ class RayPPOTrainer:
                 epochs=ppo_epochs,
                 seed=seed,
                 dataloader_kwargs={"shuffle": shuffle},
+                global_step=self.global_steps,
+                save_root=self.config.trainer.default_local_dir,
             )
 
             actor_output = self.actor_rollout_wg.update_actor(batch_td)
@@ -1289,11 +1152,12 @@ class RayPPOTrainer:
                     )
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
                 batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
-
+                need_rollout = batch.non_tensor_batch.get("need_rollout", [True])[0]
                 # add uid to batch
-                batch.non_tensor_batch["uid"] = np.array(
-                    [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
-                )
+                if "uid" not in batch.non_tensor_batch:
+                    batch.non_tensor_batch["uid"] = np.array(
+                        [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
+                    )
 
                 gen_batch = self._get_gen_batch(batch)
 
@@ -1351,6 +1215,7 @@ class RayPPOTrainer:
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
+
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),
@@ -1430,6 +1295,19 @@ class RayPPOTrainer:
                         with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
                             ref_log_prob = self._compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
+                    
+                    if self.config.actor_rollout_ref.actor.policy_loss.loss_mode == "dpo":
+                        new_indices = []
+                        for i in range(0, batch.batch.batch_size[0], 2):
+                            assert batch.non_tensor_batch["uid"][i] == batch.non_tensor_batch["uid"][i + 1], "Please set data.shuffle=False and trainer.balance_batch=False"
+                            new_indices.append(i + 1)
+                            new_indices.append(i)
+                        swap_ref_log_prob = batch.batch["ref_log_prob"][new_indices]
+                        swap_old_log_prob = batch.batch["old_log_probs"][new_indices]
+                        batch.batch["swap_response_mask"] = batch.batch["response_mask"][new_indices]
+                        batch.batch["old_log_probs"] = torch.cat([swap_old_log_prob, swap_ref_log_prob], dim=1)
+                    elif not need_rollout:
+                        batch.batch["old_log_probs"] = batch.batch["ref_log_prob"]
 
                     # compute values
                     if self.use_critic:

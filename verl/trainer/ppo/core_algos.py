@@ -26,6 +26,7 @@ from typing import Any, Callable, Optional
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from omegaconf import DictConfig
 
 import verl.utils.torch_functional as verl_F
@@ -1497,6 +1498,45 @@ def compute_policy_loss_gspo(
     }
     return pg_loss, pg_metrics
 
+@register_policy_loss("dpo")
+def dpo_loss(
+    win_log_prob: torch.Tensor,
+    lose_log_prob: torch.Tensor,
+    win_ref_log_prob: torch.Tensor,
+    lose_ref_log_prob: torch.Tensor,
+    win_response_mask: torch.Tensor,
+    lose_response_mask: torch.Tensor,
+    config: Optional[ActorConfig] = None,
+    rollout_is_weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    
+    dpo_beta = config.dpo_config["beta"]
+    loss_type = config.dpo_config["loss_type"]
+    
+    win_logratios = win_log_prob - win_ref_log_prob
+    win_logratios = (win_logratios * win_response_mask).sum(dim=-1)
+    lose_logratios = lose_log_prob - lose_ref_log_prob
+    lose_logratios = (lose_logratios * lose_response_mask).sum(dim=1)
+    logits = win_logratios - lose_logratios
+    
+    if loss_type == "dpo":
+        losses = -F.logsigmoid(dpo_beta * logits)
+    elif loss_type == "ipo":
+        # eqn (17) of the paper where beta is the regularization parameter for the IPO loss, denoted by tau in the paper.
+        losses = (logits - 1 / (2 * dpo_beta)) ** 2
+    else:
+        raise ValueError(f"Unknown dpo loss type: {loss_type}")
+    
+    approx_kl = torch.cat([win_log_prob, lose_log_prob], dim=1) - torch.cat([win_ref_log_prob, lose_ref_log_prob], dim=1)
+    ppo_kl = verl_F.masked_mean(-approx_kl, torch.cat([win_response_mask, lose_response_mask], dim=1))
+    pg_metrics = {
+        "actor/ppo_kl": ppo_kl.detach().item(),
+        "actor/chosen_reward": win_logratios.mean().detach().item(),
+        "actor/reject_reward": lose_logratios.mean().detach().item(),
+    }
+    pg_metrics["actor/reward"] = pg_metrics["actor/chosen_reward"] - pg_metrics["actor/reject_reward"]
+    
+    return losses.mean(), pg_metrics
 
 @register_policy_loss("sapo")
 def compute_policy_loss_sapo(
@@ -1573,10 +1613,12 @@ def compute_policy_loss_sapo(
     pg_clipfrac_lower = torch.tensor(0.0, device=pg_loss.device)
     # compute KL for metrics tracking
     ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+    ppo_kl_adv = verl_F.masked_var(-negative_approx_kl, response_mask)
     # return metrics dict
     pg_metrics = {
         "actor/pg_clipfrac": pg_clipfrac.detach().item(),
         "actor/ppo_kl": ppo_kl.detach().item(),
+        "actor/ppo_kl_adv": ppo_kl_adv.detach().item(),
         "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
     }
 

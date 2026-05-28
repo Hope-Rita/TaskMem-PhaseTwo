@@ -66,3 +66,26 @@ sandbox_fusion:
   max_concurrent: 64
   # Max memory limit for each sandbox process in MB
   memory_limit_mb: 1024
+
+
+reward_kwargs:
+  # max response token length to consider when scanning for <think> blocks
+  max_response_length: 8196
+
+  # upper bound on think-block length (used as eval-only metric, not as penalty)
+  think_length_threshold: 1600
+
+  # only the first `memory_length_threshold` descriptions are evaluated
+  memory_length_threshold: 5
+
+  # per-memory token length cap; longer memories are marked invalid
+  memory_token_threshold: 25
+
+  # text reward model (LLM judge)
+  model_name_text: gpt-4o-2024-11-20
+
+  # video reward model (LLM judge)
+  model_name_video: gemini-2.5-flash
+
+  # path of task related questions (must be provided by user)
+  question_path: null

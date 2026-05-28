@@ -167,6 +167,9 @@ class FSDPEngine(BaseEngine):
         Sets up checkpoint manager and FLOPs counter.
         """
         # This is used to import external_lib into the huggingface systems
+        import modeling.qwen3hf_ada as qwen3hf_ada
+        qwen3hf_ada.register()        
+
         self._build_model_optimizer()
 
         self.checkpoint_manager = FSDPCheckpointManager(
@@ -209,7 +212,11 @@ class FSDPEngine(BaseEngine):
     def _build_module(self):
         from verl.utils.model import get_hf_auto_model_class
         from verl.utils.torch_dtypes import PrecisionType
-
+        from transformers import AutoConfig
+        self.model_config.hf_config = AutoConfig.from_pretrained(
+            self.model_config.local_path,
+            trust_remote_code=self.model_config.trust_remote_code,
+        )
         torch_dtype = self.engine_config.model_dtype
 
         if torch_dtype is None:
@@ -226,14 +233,12 @@ class FSDPEngine(BaseEngine):
             warnings.simplefilter("ignore")
 
             auto_class = get_hf_auto_model_class(hf_config=self.model_config.hf_config)
-
             module = auto_class.from_pretrained(
                 pretrained_model_name_or_path=self.model_config.local_path,
                 torch_dtype=torch_dtype,
                 config=self.model_config.hf_config,
                 trust_remote_code=self.model_config.trust_remote_code,
             )
-
             use_liger = self.model_config.use_liger
             # Apply Liger kernel to the model if use_liger is set to True
             if use_liger:
